@@ -21,7 +21,6 @@
  *   - R2_MONTHLY_RESET_CRON_MIN    (default: 60)  // scheduler interval check
  *   - PGSSLMODE (if set, enables ssl rejectUnauthorized:false)
  */
-
 const express = require("express");
 const { Pool } = require("pg");
 const multer = require("multer");
