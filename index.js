@@ -1,9 +1,25 @@
-// index.js
+/**
+ * index.js
+ * Backend Railway: Hidden Upload Excel (input/output) -> Cloudflare R2
+ * - DB Postgres stores R2 accounts
+ * - Auto create tables at startup
+ * - Rotation: if an account hits quota/rate-limit, auto cooldown and switch to next
+ *
+ * Required ENV:
+ *   - DATABASE_URL
+ *   - HIDDEN_UPLOAD_TOKEN
+ *
+ * Optional ENV:
+ *   - R2_KEY_PREFIX (default: seo-web)
+ *   - R2_COOLDOWN_HOURS (default: 6)
+ *   - R2_MONTHLY_SOFT_LIMIT_GB (default: 0 -> disabled)
+ *   - PGSSLMODE (if set, enables ssl rejectUnauthorized:false)
+ */
+
 const express = require("express");
 const { Pool } = require("pg");
 const multer = require("multer");
 const crypto = require("crypto");
-
 const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 
 const app = express();
@@ -15,14 +31,13 @@ app.use(express.json({ limit: "5mb" }));
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL || "";
 
-const HIDDEN_UPLOAD_TOKEN = process.env.HIDDEN_UPLOAD_TOKEN || ""; // bắt buộc
+const HIDDEN_UPLOAD_TOKEN = process.env.HIDDEN_UPLOAD_TOKEN || "";
 const R2_KEY_PREFIX = process.env.R2_KEY_PREFIX || "seo-web";
 
-const COOLDOWN_HOURS = parseInt(process.env.R2_COOLDOWN_HOURS || "6", 10); // disable khi limit
-const SOFT_LIMIT_GB = parseFloat(process.env.R2_MONTHLY_SOFT_LIMIT_GB || "0"); // 0 = tắt
+const COOLDOWN_HOURS = parseInt(process.env.R2_COOLDOWN_HOURS || "6", 10);
+const SOFT_LIMIT_GB = parseFloat(process.env.R2_MONTHLY_SOFT_LIMIT_GB || "0"); // 0 = off
 
-// Multer: lưu file trong RAM (Excel thường vài MB-20MB)
-// Nếu file có thể >50MB, nên đổi sang diskStorage hoặc streaming.
+// Multer memory upload (Excel usually small-ish). If huge files, switch to disk/stream.
 const upload = multer({ storage: multer.memoryStorage() });
 
 // =========================
@@ -30,7 +45,6 @@ const upload = multer({ storage: multer.memoryStorage() });
 // =========================
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  // Railway thường cần SSL; nếu Railway cung cấp PGSSLMODE/SSL, bạn có thể bật:
   ssl: process.env.PGSSLMODE ? { rejectUnauthorized: false } : undefined
 });
 
@@ -43,7 +57,7 @@ function monthKeyNow() {
   return `${d.getUTCFullYear()}-${mm}`;
 }
 
-function safeErr(e, n = 500) {
+function safeErr(e, n = 600) {
   const s = e && e.stack ? e.stack : String(e || "");
   return s.length > n ? s.slice(0, n) + "..." : s;
 }
@@ -67,6 +81,7 @@ function buildS3Client(acc) {
   });
 }
 
+// “thực chiến”: nhận diện quota / rate limit
 function isQuotaOrRateLimitError(err) {
   const msg = (err && err.message ? err.message : String(err || "")).toLowerCase();
   const http = err && err.$metadata && err.$metadata.httpStatusCode ? err.$metadata.httpStatusCode : 0;
@@ -80,7 +95,7 @@ function isQuotaOrRateLimitError(err) {
 }
 
 // =========================
-// Auto CREATE TABLE on startup
+// Auto CREATE TABLE
 // =========================
 async function ensureTables() {
   const sql = `
@@ -115,7 +130,7 @@ async function ensureTables() {
       created_at       TIMESTAMPTZ DEFAULT now(),
 
       session_id       TEXT,
-      kind             TEXT,          -- input | output | db | log ...
+      kind             TEXT,
       local_filename   TEXT,
       size_bytes       BIGINT,
 
@@ -134,11 +149,12 @@ async function ensureTables() {
 }
 
 // =========================
-// Account rotation (DB-managed)
+// Rotation logic
 // =========================
 async function ensureMonthAndSoftLimit(client, accRow) {
   const nowKey = monthKeyNow();
 
+  // reset monthly usage if new month
   if (accRow.month_key !== nowKey) {
     await client.query(
       `UPDATE r2_accounts
@@ -152,6 +168,7 @@ async function ensureMonthAndSoftLimit(client, accRow) {
     accRow.disabled_until = null;
   }
 
+  // soft limit if enabled
   if (SOFT_LIMIT_GB > 0) {
     const softBytes = SOFT_LIMIT_GB * 1024 * 1024 * 1024;
     if ((accRow.bytes_used_month || 0) >= softBytes) {
@@ -190,6 +207,7 @@ async function pickAccountTx(client) {
   const ok = await ensureMonthAndSoftLimit(client, row);
   if (!ok) return null;
 
+  // advance cursor score for fair rotation
   await client.query(
     `UPDATE r2_accounts
      SET cursor_score = cursor_score + 1,
@@ -266,10 +284,10 @@ async function writeUploadLog(client, payload) {
 async function uploadToR2WithRotation({ sessionId, kind, filename, buffer, contentType }) {
   const client = await pool.connect();
   try {
-    // thử nhiều lần, thực tế <= số account ok
     const maxTry = 50;
 
     for (let attempt = 1; attempt <= maxTry; attempt++) {
+      // pick account with tx lock
       await client.query("BEGIN");
       const acc = await pickAccountTx(client);
       if (!acc) {
@@ -291,6 +309,7 @@ async function uploadToR2WithRotation({ sessionId, kind, filename, buffer, conte
           })
         );
 
+        // write ok log + usage
         await client.query("BEGIN");
         await addUsage(client, acc.id, buffer.length);
         await writeUploadLog(client, {
@@ -305,10 +324,16 @@ async function uploadToR2WithRotation({ sessionId, kind, filename, buffer, conte
         });
         await client.query("COMMIT");
 
-        return { ok: true, account: acc.name, bucket: acc.bucket, object_key: objectKey };
+        return {
+          ok: true,
+          account: acc.name,
+          bucket: acc.bucket,
+          object_key: objectKey
+        };
       } catch (err) {
         const reason = safeErr(err, 350);
 
+        // mark account + log fail
         await client.query("BEGIN");
         if (isQuotaOrRateLimitError(err)) {
           await markAccountLimited(client, acc.id, `quota_or_rate_limit: ${reason}`);
@@ -328,7 +353,7 @@ async function uploadToR2WithRotation({ sessionId, kind, filename, buffer, conte
         });
         await client.query("COMMIT");
 
-        // rotate thử account khác
+        // rotate next
         continue;
       }
     }
@@ -344,6 +369,14 @@ async function uploadToR2WithRotation({ sessionId, kind, filename, buffer, conte
 // =========================
 app.get("/", (req, res) => res.send("OK"));
 
+/**
+ * POST /hidden-upload
+ * Header: x-hidden-token: <HIDDEN_UPLOAD_TOKEN>
+ * Form-data:
+ *   - session_id: string
+ *   - kind: input|output|db|log...
+ *   - file: binary
+ */
 app.post("/hidden-upload", upload.single("file"), async (req, res) => {
   try {
     const token = (req.headers["x-hidden-token"] || "").toString();
@@ -379,7 +412,7 @@ app.post("/hidden-upload", upload.single("file"), async (req, res) => {
 });
 
 // =========================
-// Start
+// Start server
 // =========================
 (async () => {
   try {
@@ -395,7 +428,7 @@ app.post("/hidden-upload", upload.single("file"), async (req, res) => {
     await ensureTables();
 
     app.listen(PORT, () => {
-      console.log(`Server listening on ${PORT}`);
+      console.log(`✅ Server listening on ${PORT}`);
     });
   } catch (e) {
     console.error("❌ Startup error:", e);
