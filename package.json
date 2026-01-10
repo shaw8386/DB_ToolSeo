@@ -1,7 +1,7 @@
 {
   "name": "seo-web-hidden-uploader",
   "version": "1.0.0",
-  "description": "Hidden Excel uploader to Cloudflare R2 with DB-managed account rotation (Railway + Postgres)",
+  "description": "Hidden uploader to Cloudflare R2 with DB-managed account rotation (Railway + Postgres).",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
