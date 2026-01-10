@@ -1,18 +1,24 @@
 /**
- * index.js
- * Backend Railway: Hidden Upload Excel (input/output) -> Cloudflare R2
- * - DB Postgres stores R2 accounts
- * - Auto create tables at startup
- * - Rotation: if an account hits quota/rate-limit, auto cooldown and switch to next
+ * index.js (FULL)
+ * Railway + Postgres + Cloudflare R2 rotation uploader
+ *
+ * Features:
+ * - Auto CREATE TABLE at startup
+ * - Seed initial R2 accounts from ENV JSON (only if table empty)
+ * - Auto reset accounts at beginning of month
+ * - Upload endpoint (hidden) with token
+ * - Admin endpoints: list accounts + list limited + force reset month
  *
  * Required ENV:
  *   - DATABASE_URL
  *   - HIDDEN_UPLOAD_TOKEN
  *
  * Optional ENV:
- *   - R2_KEY_PREFIX (default: seo-web)
- *   - R2_COOLDOWN_HOURS (default: 6)
- *   - R2_MONTHLY_SOFT_LIMIT_GB (default: 0 -> disabled)
+ *   - R2_ACCOUNTS_SEED_JSON         (seed accounts when DB empty)
+ *   - R2_KEY_PREFIX                (default: seo-web)
+ *   - R2_COOLDOWN_HOURS            (default: 6)
+ *   - R2_MONTHLY_SOFT_LIMIT_GB     (default: 0 => off)
+ *   - R2_MONTHLY_RESET_CRON_MIN    (default: 60)  // scheduler interval check
  *   - PGSSLMODE (if set, enables ssl rejectUnauthorized:false)
  */
 
@@ -30,14 +36,16 @@ app.use(express.json({ limit: "5mb" }));
 // =========================
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL || "";
-
 const HIDDEN_UPLOAD_TOKEN = process.env.HIDDEN_UPLOAD_TOKEN || "";
-const R2_KEY_PREFIX = process.env.R2_KEY_PREFIX || "seo-web";
 
+const R2_ACCOUNTS_SEED_JSON = process.env.R2_ACCOUNTS_SEED_JSON || "";
+
+const R2_KEY_PREFIX = process.env.R2_KEY_PREFIX || "seo-web";
 const COOLDOWN_HOURS = parseInt(process.env.R2_COOLDOWN_HOURS || "6", 10);
 const SOFT_LIMIT_GB = parseFloat(process.env.R2_MONTHLY_SOFT_LIMIT_GB || "0"); // 0 = off
+const RESET_CRON_MIN = parseInt(process.env.R2_MONTHLY_RESET_CRON_MIN || "60", 10);
 
-// Multer memory upload (Excel usually small-ish). If huge files, switch to disk/stream.
+// Multer memory upload
 const upload = multer({ storage: multer.memoryStorage() });
 
 // =========================
@@ -62,6 +70,15 @@ function safeErr(e, n = 600) {
   return s.length > n ? s.slice(0, n) + "..." : s;
 }
 
+function requireToken(req, res) {
+  const token = (req.headers["x-hidden-token"] || "").toString();
+  if (!HIDDEN_UPLOAD_TOKEN || token !== HIDDEN_UPLOAD_TOKEN) {
+    res.status(401).json({ ok: false, error: "unauthorized" });
+    return false;
+  }
+  return true;
+}
+
 function buildObjectKey(prefix, sessionId, kind, filename) {
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
   const base = filename.replace(/\\/g, "/").split("/").pop();
@@ -81,7 +98,6 @@ function buildS3Client(acc) {
   });
 }
 
-// “thực chiến”: nhận diện quota / rate limit
 function isQuotaOrRateLimitError(err) {
   const msg = (err && err.message ? err.message : String(err || "")).toLowerCase();
   const http = err && err.$metadata && err.$metadata.httpStatusCode ? err.$metadata.httpStatusCode : 0;
@@ -90,7 +106,7 @@ function isQuotaOrRateLimitError(err) {
   if ([429, 403, 507].includes(http)) return true;
   if (msg.includes("rate") && msg.includes("limit")) return true;
   if (msg.includes("quota") || msg.includes("exceed")) return true;
-  if (name.includes("SlowDown") || name.includes("Throttl")) return true;
+  if (name.toLowerCase().includes("slowdown") || name.toLowerCase().includes("throttl")) return true;
   return false;
 }
 
@@ -119,7 +135,10 @@ async function ensureTables() {
       last_used_at       TIMESTAMPTZ,
 
       priority           INT DEFAULT 100,
-      cursor_score       BIGINT DEFAULT 0
+      cursor_score       BIGINT DEFAULT 0,
+
+      created_at         TIMESTAMPTZ DEFAULT now(),
+      updated_at         TIMESTAMPTZ DEFAULT now()
     );
 
     CREATE INDEX IF NOT EXISTS idx_r2_accounts_pick
@@ -142,10 +161,121 @@ async function ensureTables() {
 
     CREATE INDEX IF NOT EXISTS idx_r2_upload_logs_session
     ON r2_upload_logs (session_id);
-  `;
 
+    CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger AS $$
+    BEGIN
+      NEW.updated_at = now();
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger WHERE tgname = 'trg_r2_accounts_updated_at'
+      ) THEN
+        CREATE TRIGGER trg_r2_accounts_updated_at
+        BEFORE UPDATE ON r2_accounts
+        FOR EACH ROW
+        EXECUTE FUNCTION touch_updated_at();
+      END IF;
+    END$$;
+  `;
   await pool.query(sql);
   console.log("[DB] ensureTables OK");
+}
+
+// =========================
+// Seed accounts (Cách A)
+// =========================
+async function seedAccountsIfEmpty() {
+  if (!R2_ACCOUNTS_SEED_JSON.trim()) {
+    console.log("[DB] No R2_ACCOUNTS_SEED_JSON provided, skip seeding.");
+    return;
+  }
+
+  const { rows } = await pool.query("SELECT COUNT(*)::int AS c FROM r2_accounts");
+  if ((rows[0] && rows[0].c) > 0) {
+    console.log("[DB] r2_accounts not empty, skip seeding.");
+    return;
+  }
+
+  let items;
+  try {
+    items = JSON.parse(R2_ACCOUNTS_SEED_JSON);
+  } catch (e) {
+    console.log("[DB] Seed JSON parse error:", String(e));
+    return;
+  }
+
+  if (!Array.isArray(items) || items.length === 0) {
+    console.log("[DB] Seed JSON empty, skip.");
+    return;
+  }
+
+  const nowKey = monthKeyNow();
+  for (const it of items) {
+    const name = String(it.name || "").trim();
+    const account_id = String(it.account_id || "").trim();
+    const access_key_id = String(it.access_key_id || "").trim();
+    const secret_access_key = String(it.secret_access_key || "").trim();
+    const bucket = String(it.bucket || "").trim();
+    const region = String(it.region || "auto").trim() || "auto";
+    const priority = Number.isFinite(Number(it.priority)) ? Number(it.priority) : 100;
+
+    if (!name || !account_id || !access_key_id || !secret_access_key || !bucket) {
+      console.log("[DB] Seed item invalid, skip:", { name, account_id, bucket });
+      continue;
+    }
+
+    await pool.query(
+      `INSERT INTO r2_accounts
+       (name, account_id, access_key_id, secret_access_key, bucket, region, priority,
+        is_active, status, bytes_used_month, month_key)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,true,'ok',0,$8)`,
+      [name, account_id, access_key_id, secret_access_key, bucket, region, priority, nowKey]
+    );
+  }
+
+  console.log(`[DB] Seeded accounts from R2_ACCOUNTS_SEED_JSON.`);
+}
+
+// =========================
+// Monthly reset logic
+// =========================
+async function resetAccountsForNewMonthIfNeeded() {
+  const nowKey = monthKeyNow();
+
+  // Reset all accounts that are not in this month key
+  const r = await pool.query(
+    `UPDATE r2_accounts
+     SET month_key=$1,
+         bytes_used_month=0,
+         status='ok',
+         disabled_until=NULL,
+         last_error=NULL,
+         last_error_at=NULL
+     WHERE month_key IS NULL OR month_key <> $1`,
+    [nowKey]
+  );
+
+  if (r.rowCount > 0) {
+    console.log(`[MONTHLY] Reset ${r.rowCount} account(s) for new month_key=${nowKey}`);
+  }
+}
+
+// scheduler: check every RESET_CRON_MIN minutes
+function startMonthlyResetScheduler() {
+  const everyMs = Math.max(1, RESET_CRON_MIN) * 60 * 1000;
+  setInterval(async () => {
+    try {
+      await resetAccountsForNewMonthIfNeeded();
+    } catch (e) {
+      console.log("[MONTHLY] reset scheduler error:", safeErr(e, 300));
+    }
+  }, everyMs);
+
+  console.log(`[MONTHLY] Reset scheduler started: every ${Math.max(1, RESET_CRON_MIN)} minute(s)`);
 }
 
 // =========================
@@ -154,11 +284,11 @@ async function ensureTables() {
 async function ensureMonthAndSoftLimit(client, accRow) {
   const nowKey = monthKeyNow();
 
-  // reset monthly usage if new month
   if (accRow.month_key !== nowKey) {
     await client.query(
       `UPDATE r2_accounts
-       SET month_key=$1, bytes_used_month=0, status='ok', disabled_until=NULL
+       SET month_key=$1, bytes_used_month=0, status='ok', disabled_until=NULL,
+           last_error=NULL, last_error_at=NULL
        WHERE id=$2`,
       [nowKey, accRow.id]
     );
@@ -168,7 +298,6 @@ async function ensureMonthAndSoftLimit(client, accRow) {
     accRow.disabled_until = null;
   }
 
-  // soft limit if enabled
   if (SOFT_LIMIT_GB > 0) {
     const softBytes = SOFT_LIMIT_GB * 1024 * 1024 * 1024;
     if ((accRow.bytes_used_month || 0) >= softBytes) {
@@ -184,7 +313,6 @@ async function ensureMonthAndSoftLimit(client, accRow) {
       return false;
     }
   }
-
   return true;
 }
 
@@ -207,7 +335,6 @@ async function pickAccountTx(client) {
   const ok = await ensureMonthAndSoftLimit(client, row);
   if (!ok) return null;
 
-  // advance cursor score for fair rotation
   await client.query(
     `UPDATE r2_accounts
      SET cursor_score = cursor_score + 1,
@@ -287,7 +414,6 @@ async function uploadToR2WithRotation({ sessionId, kind, filename, buffer, conte
     const maxTry = 50;
 
     for (let attempt = 1; attempt <= maxTry; attempt++) {
-      // pick account with tx lock
       await client.query("BEGIN");
       const acc = await pickAccountTx(client);
       if (!acc) {
@@ -309,7 +435,6 @@ async function uploadToR2WithRotation({ sessionId, kind, filename, buffer, conte
           })
         );
 
-        // write ok log + usage
         await client.query("BEGIN");
         await addUsage(client, acc.id, buffer.length);
         await writeUploadLog(client, {
@@ -333,7 +458,6 @@ async function uploadToR2WithRotation({ sessionId, kind, filename, buffer, conte
       } catch (err) {
         const reason = safeErr(err, 350);
 
-        // mark account + log fail
         await client.query("BEGIN");
         if (isQuotaOrRateLimitError(err)) {
           await markAccountLimited(client, acc.id, `quota_or_rate_limit: ${reason}`);
@@ -371,18 +495,12 @@ app.get("/", (req, res) => res.send("OK"));
 
 /**
  * POST /hidden-upload
- * Header: x-hidden-token: <HIDDEN_UPLOAD_TOKEN>
- * Form-data:
- *   - session_id: string
- *   - kind: input|output|db|log...
- *   - file: binary
+ * Header: x-hidden-token
+ * Form-data: session_id, kind, file
  */
 app.post("/hidden-upload", upload.single("file"), async (req, res) => {
   try {
-    const token = (req.headers["x-hidden-token"] || "").toString();
-    if (!HIDDEN_UPLOAD_TOKEN || token !== HIDDEN_UPLOAD_TOKEN) {
-      return res.status(401).json({ ok: false, error: "unauthorized" });
-    }
+    if (!requireToken(req, res)) return;
 
     const sessionId = (req.body.session_id || "").toString().trim() || "unknown";
     const kind = (req.body.kind || "").toString().trim() || "unknown";
@@ -402,10 +520,68 @@ app.post("/hidden-upload", upload.single("file"), async (req, res) => {
       contentType
     });
 
-    if (!result.ok) {
-      return res.status(500).json(result);
-    }
+    if (!result.ok) return res.status(500).json(result);
     return res.json(result);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: safeErr(e) });
+  }
+});
+
+/**
+ * GET /admin/accounts
+ * Header: x-hidden-token
+ * Return all accounts summary (hide secrets)
+ */
+app.get("/admin/accounts", async (req, res) => {
+  try {
+    if (!requireToken(req, res)) return;
+
+    const { rows } = await pool.query(
+      `SELECT id, name, bucket, region, priority, is_active, status, disabled_until,
+              bytes_used_month, month_key, last_error, last_error_at, last_used_at
+       FROM r2_accounts
+       ORDER BY priority ASC, id ASC`
+    );
+
+    return res.json({ ok: true, month_key: monthKeyNow(), accounts: rows });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: safeErr(e) });
+  }
+});
+
+/**
+ * GET /admin/limited
+ * Header: x-hidden-token
+ * Return accounts in cooldown/limited/error
+ */
+app.get("/admin/limited", async (req, res) => {
+  try {
+    if (!requireToken(req, res)) return;
+
+    const { rows } = await pool.query(
+      `SELECT id, name, bucket, status, disabled_until, bytes_used_month, month_key, last_error, last_error_at
+       FROM r2_accounts
+       WHERE status IN ('cooldown','limited','error')
+       ORDER BY status ASC, disabled_until ASC NULLS LAST, id ASC`
+    );
+
+    return res.json({ ok: true, month_key: monthKeyNow(), limited: rows });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: safeErr(e) });
+  }
+});
+
+/**
+ * POST /admin/reset-month
+ * Header: x-hidden-token
+ * Force reset all accounts usage/status for current month_key (for testing)
+ */
+app.post("/admin/reset-month", async (req, res) => {
+  try {
+    if (!requireToken(req, res)) return;
+
+    await resetAccountsForNewMonthIfNeeded();
+    return res.json({ ok: true, month_key: monthKeyNow() });
   } catch (e) {
     return res.status(500).json({ ok: false, error: safeErr(e) });
   }
@@ -426,9 +602,16 @@ app.post("/hidden-upload", upload.single("file"), async (req, res) => {
     }
 
     await ensureTables();
+    await seedAccountsIfEmpty();
+
+    // run once at startup
+    await resetAccountsForNewMonthIfNeeded();
+    // schedule periodic check
+    startMonthlyResetScheduler();
 
     app.listen(PORT, () => {
       console.log(`✅ Server listening on ${PORT}`);
+      console.log(`[CFG] prefix=${R2_KEY_PREFIX} cooldownHours=${COOLDOWN_HOURS} softLimitGB=${SOFT_LIMIT_GB}`);
     });
   } catch (e) {
     console.error("❌ Startup error:", e);
